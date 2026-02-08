@@ -234,26 +234,55 @@ class ICRScore:
 
                 current_token_attn = self.pooling_attentions[layer][token]
 
- 
-                top_k = min(top_k, len(current_token_attn)) if (top_k is not None) else len(current_token_attn)
-                top_k = top_k if top_p is None else int(top_p * len(current_token_attn))
-                top_p_token = top_k/max(len(current_token_attn),1e-6)
+                # Filter out zero attentions before selecting top-k
+                non_zero_mask = current_token_attn > 1e-10
+                non_zero_count = non_zero_mask.sum().item()
+                
+                # If all attentions are zero (edge case after masking), use default score
+                if non_zero_count == 0:
+                    icr_scores_layer.append(0.0)
+                    top_p_layer.append(0.0)
+                    continue
+                
+                # Select top-k only from non-zero values
+                current_token_attn_nonzero = current_token_attn[non_zero_mask]
+                top_k_actual = min(top_k, len(current_token_attn_nonzero)) if (top_k is not None) else len(current_token_attn_nonzero)
+                top_k_actual = top_k_actual if top_p is None else max(1, int(top_p * len(current_token_attn_nonzero)))
+                
+                top_p_token = top_k_actual / max(len(current_token_attn_nonzero), 1e-6)
                 top_p_layer.append(top_p_token)
-                current_token_attn_topk, current_token_attn_topk_idx = torch.topk(current_token_attn, k=top_k)
+                
+                current_token_attn_topk, topk_indices_relative = torch.topk(current_token_attn_nonzero, k=top_k_actual)
+                # Map back to original indices
+                original_indices = torch.nonzero(non_zero_mask).squeeze(-1)
+                current_token_attn_topk_idx = original_indices[topk_indices_relative]
              
                 current_token_hs = self.output_hidden_states[layer + 1][token]
                 previous_token_hs = self.output_hidden_states[layer][token]
                 current_layer_all_hs = self.origin_hidden_states[layer]
                 current_token_hs_topk = current_layer_all_hs[current_token_attn_topk_idx]
                 hs_diff = (current_token_hs - previous_token_hs)
+                
+                # Check if hidden state diff is all zeros (no update in this layer)
+                if torch.abs(hs_diff).sum() < 1e-10:
+                    icr_scores_layer.append(0.0)
+                    continue
     
                 w_i = torch.sum(hs_diff * current_token_hs_topk, dim=1) / (
                         torch.norm(current_token_hs_topk, dim=1) + 1e-8)
+                
                 if attention_uniform: # ablation study
                     current_token_attn_topk = torch.ones_like(current_token_attn_topk) / len(current_token_attn_topk)
                 if hidden_uniform: # ablation study
                     w_i = torch.ones_like(w_i) / len(w_i)
+                
                 icr_score = js_divergence(w_i, current_token_attn_topk)
+                
+                # Final NaN check (should not happen now, but just in case)
+                if np.isnan(icr_score):
+                    print(f"Warning: NaN detected at layer {layer}, token {token}. Using 0.0 instead.")
+                    icr_score = 0.0
+                    
                 icr_scores_layer.append(icr_score)
             top_p_list.append(top_p_layer)
 
@@ -264,14 +293,31 @@ class ICRScore:
         return icr_scores_item, top_p_mean
 
 
-def kl_divergence(P, Q):
-    kl_divergence = (P * (P / Q).log()).sum()
-    return kl_divergence.item()
+def kl_divergence(P, Q, eps=1e-10):
+    """KL divergence with epsilon to avoid log(0) and division by zero."""
+    # Clamp to avoid numerical issues
+    P = torch.clamp(P, min=eps)
+    Q = torch.clamp(Q, min=eps)
+    kl_div = (P * torch.log(P / Q)).sum()
+    return kl_div.item()
 
 def js_divergence(p, q):
-    # standardize: p, q -> N(0, 1)
-    p = (p - p.mean()) / max(p.std(), 1e-8)
-    q = (q - q.mean()) / max(q.std(), 1e-8)
+    """Jensen-Shannon divergence with robust standardization."""
+    # standardize: p, q -> N(0, 1) with proper handling of zero std
+    p_std = p.std()
+    q_std = q.std()
+    
+    if p_std > 1e-8:
+        p = (p - p.mean()) / p_std
+    else:
+        # If std is zero, all values are the same, just center them
+        p = p - p.mean()
+    
+    if q_std > 1e-8:
+        q = (q - q.mean()) / q_std
+    else:
+        q = q - q.mean()
+    
     # softmax: p, q -> [0, 1]
     p = F.softmax(p, dim=0)
     q = F.softmax(q, dim=0)

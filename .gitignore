@@ -14,3 +14,4 @@ __pycache__/
 .vscode/
 .claude/
 src/__pycache__/
+saves/
