@@ -22,18 +22,13 @@ logger = logging.getLogger(__name__)
 class ICRProbeTrainer:
     """Trainer class for ICR Probe."""
     
-    def __init__(self, model, train_loader, val_loader, config):
+    def __init__(self, train_loader, val_loader, config):
         self.config = config
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.model = None
         self.train_loader = train_loader
         self.val_loader = val_loader
-        
-    def setup_data(self):
-        """Setup data loaders."""
-        data = self._load_data()
-        self.train_loader, self.val_loader = self._create_data_loaders(data)
-        
+
     def setup_model(self):
         """Setup model and optimization components."""
         input_dim = next(iter(self.train_loader))[0].shape[1]

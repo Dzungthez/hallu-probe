@@ -23,6 +23,7 @@ class Config:
     # Data parameters
     test_size: float = 0.2
     dataset_weight: bool = True
+    halu_threshold: float = 0.5
     
     # Paths
     data_dir: str = None
