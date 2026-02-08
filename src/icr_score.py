@@ -17,10 +17,20 @@ def move_tensors_to_device(container, device):
 
 class ICRScore:
 
-    def __init__(self, hidden_states, attentions, skew_threshold=3, entropy_threshold=3, core_positions=None,icr_device=None):
-        self.origional_device = hidden_states[0][0].device
+    def __init__(
+        self,
+        hidden_states,
+        attentions,
+        skew_threshold=3,
+        entropy_threshold=3,
+        core_positions=None,
+        icr_device=None,
+        keep_user_prompt_attn=False,
+    ):
+        self.original_device = hidden_states[0][0].device
         self.icr_device = icr_device
-        if self.icr_device != self.origional_device:
+        self.keep_user_prompt_attn = keep_user_prompt_attn
+        if self.icr_device != self.original_device:
             hidden_states = move_tensors_to_device(hidden_states, self.icr_device)
             attentions = move_tensors_to_device(attentions, self.icr_device)
 
@@ -118,6 +128,9 @@ class ICRScore:
         mask = torch.zeros((layer_num, head_num, token_num, token_num), dtype=torch.bool)
         mask[:, :, a:b, a:b] = True
         mask[:, :, c:, c:] = True
+        if self.keep_user_prompt_attn:
+            # Allow response tokens to attend to user prompt (exclude system prompt).
+            mask[:, :, c:, a:b] = True
 
         # Use the boolean mask to set unwanted positions to 0
         attn_all[~mask] = 0

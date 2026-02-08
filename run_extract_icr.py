@@ -40,6 +40,11 @@ def parse_args():
     parser.add_argument("--split", type=str, default="train", choices=["train", "test", "all"])
     parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--checkpoint_every", type=int, default=500)
+    parser.add_argument(
+        "--keep_user_prompt_attn",
+        action="store_true",
+        help="Allow response tokens to attend to user prompt (exclude system prompt).",
+    )
     return parser.parse_args()
 
 
@@ -310,6 +315,7 @@ def main():
                 attentions=attentions,
                 core_positions=core_pos,
                 icr_device=icr_device,
+                keep_user_prompt_attn=args.keep_user_prompt_attn,
             )
             icr_scores_item, _ = icr.compute_icr(
                 top_k=20,
