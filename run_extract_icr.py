@@ -38,6 +38,7 @@ def parse_args():
     parser.add_argument("--save_dir", type=str, default="saves/halueval")
     parser.add_argument("--max_seq_len", type=int, default=512)
     parser.add_argument("--split", type=str, default="train", choices=["train", "test", "all"])
+    parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--checkpoint_every", type=int, default=500)
     return parser.parse_args()
 
@@ -214,92 +215,141 @@ def main():
         start_idx = 0
 
     icr_device = "cuda:0"
+    batch_size = args.batch_size
     total_samples = len(samples)
     start_time = time.time()
+    processed_count = len(icr_scores_dict)
 
-    for idx in range(start_idx, total_samples):
-        sample = samples[idx]
-        system_msg, user_msg, assistant_msg = format_messages(sample)
+    # Ensure tokenizer has pad token for batching
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
 
-        # Compute positions and tokenize
-        core_positions, prompt_ids, full_ids = compute_core_positions(
-            tokenizer, system_msg, user_msg, assistant_msg
-        )
+    for batch_start in range(start_idx, total_samples, batch_size):
+        batch_end = min(batch_start + batch_size, total_samples)
 
-        # Truncate if too long
-        if len(full_ids) > args.max_seq_len:
-            full_ids = full_ids[: args.max_seq_len]
-            # Adjust response_start if prompt itself is within limits
-            if core_positions["response_start"] >= args.max_seq_len:
-                logger.warning(f"Sample {idx}: prompt alone exceeds max_seq_len, skipping")
+        # --- Prepare batch: tokenize, filter, collect metadata ---
+        batch_input_ids = []
+        batch_core_positions = []
+        batch_seq_lens = []
+        batch_indices = []
+
+        for idx in range(batch_start, batch_end):
+            if idx in icr_scores_dict:
                 continue
 
-        input_len = core_positions["response_start"]
-        answer_len = len(full_ids) - input_len
+            sample = samples[idx]
+            system_msg, user_msg, assistant_msg = format_messages(sample)
+            core_positions, prompt_ids, full_ids = compute_core_positions(
+                tokenizer, system_msg, user_msg, assistant_msg
+            )
 
-        if answer_len <= 0:
-            logger.warning(f"Sample {idx}: no answer tokens after truncation, skipping")
+            # Truncate if too long
+            if len(full_ids) > args.max_seq_len:
+                full_ids = full_ids[: args.max_seq_len]
+                if core_positions["response_start"] >= args.max_seq_len:
+                    logger.warning(f"Sample {idx}: prompt alone exceeds max_seq_len, skipping")
+                    continue
+
+            input_len = core_positions["response_start"]
+            answer_len = len(full_ids) - input_len
+
+            if answer_len <= 0:
+                logger.warning(f"Sample {idx}: no answer tokens after truncation, skipping")
+                continue
+
+            batch_input_ids.append(full_ids)
+            batch_core_positions.append(core_positions)
+            batch_seq_lens.append(len(full_ids))
+            batch_indices.append(idx)
+
+        if not batch_input_ids:
             continue
 
-        # Forward pass
-        input_ids = torch.tensor([full_ids], dtype=torch.long).to(model.device)
+        # --- Pad sequences (right padding) and build attention mask ---
+        max_len = max(batch_seq_lens)
+        pad_id = tokenizer.pad_token_id
 
+        padded_ids = []
+        attention_masks = []
+        for ids in batch_input_ids:
+            pad_len = max_len - len(ids)
+            padded_ids.append(ids + [pad_id] * pad_len)
+            attention_masks.append([1] * len(ids) + [0] * pad_len)
+
+        input_ids_tensor = torch.tensor(padded_ids, dtype=torch.long).to(model.device)
+        attention_mask_tensor = torch.tensor(attention_masks, dtype=torch.long).to(model.device)
+
+        # --- Batched forward pass ---
         with torch.no_grad():
             outputs = model(
-                input_ids,
+                input_ids_tensor,
+                attention_mask=attention_mask_tensor,
                 output_hidden_states=True,
                 output_attentions=True,
             )
 
-        # Restructure outputs for ICRScore
-        hidden_states = restructure_hidden_states(outputs.hidden_states, input_len)
-        attentions = restructure_attentions(outputs.attentions, input_len)
+        # --- Per-sample ICR computation ---
+        for b, idx in enumerate(batch_indices):
+            seq_len = batch_seq_lens[b]
+            core_pos = batch_core_positions[b]
+            input_len = core_pos["response_start"]
 
-        # Compute ICR scores
-        icr = ICRScore(
-            hidden_states=hidden_states,
-            attentions=attentions,
-            core_positions=core_positions,
-            icr_device=icr_device,
-        )
-        icr_scores_item, _ = icr.compute_icr(
-            top_k=20,
-            top_p=0.1,
-            pooling="mean",
-            attention_uniform=False,
-            hidden_uniform=False,
-            use_induction_head=True,
-        )
-
-        # Store results
-        icr_scores_dict[idx] = icr_scores_item  # [L_attn][N_answer_tokens]
-        label = 1 if sample["hallucination"] == "no" else 0
-        labels_dict[idx] = label
-
-        # Clean up
-        del outputs, hidden_states, attentions, icr, input_ids
-        torch.cuda.empty_cache()
-
-        # Log progress
-        if (idx + 1) % 50 == 0:
-            elapsed = time.time() - start_time
-            samples_done = idx + 1 - start_idx
-            rate = elapsed / max(samples_done, 1)
-            remaining = rate * (total_samples - idx - 1)
-            logger.info(
-                f"[{idx + 1}/{total_samples}] "
-                f"{rate:.2f}s/sample, "
-                f"ETA: {remaining / 60:.1f}min"
+            # Extract per-sample hidden states & attentions (strip padding)
+            sample_hs = tuple(
+                hs[b : b + 1, :seq_len, :] for hs in outputs.hidden_states
+            )
+            sample_attn = tuple(
+                attn[b : b + 1, :, :seq_len, :seq_len] for attn in outputs.attentions
             )
 
-        # Checkpoint
-        if (idx + 1) % args.checkpoint_every == 0:
-            logger.info(f"Saving checkpoint at sample {idx + 1}...")
+            hidden_states = restructure_hidden_states(sample_hs, input_len)
+            attentions = restructure_attentions(sample_attn, input_len)
+
+            icr = ICRScore(
+                hidden_states=hidden_states,
+                attentions=attentions,
+                core_positions=core_pos,
+                icr_device=icr_device,
+            )
+            icr_scores_item, _ = icr.compute_icr(
+                top_k=20,
+                top_p=0.1,
+                pooling="mean",
+                attention_uniform=False,
+                hidden_uniform=False,
+                use_induction_head=True,
+            )
+
+            icr_scores_dict[idx] = icr_scores_item
+            label = 1 if samples[idx]["hallucination"] == "no" else 0
+            labels_dict[idx] = label
+
+            del sample_hs, sample_attn, hidden_states, attentions, icr
+
+        # --- Clean up batch ---
+        del outputs, input_ids_tensor, attention_mask_tensor
+        torch.cuda.empty_cache()
+
+        # --- Log progress ---
+        processed_count += len(batch_indices)
+        elapsed = time.time() - start_time
+        rate = elapsed / max(processed_count, 1)
+        remaining = rate * (total_samples - batch_end)
+        logger.info(
+            f"[{batch_end}/{total_samples}] "
+            f"batch={len(batch_indices)}, "
+            f"{rate:.2f}s/sample, "
+            f"ETA: {remaining / 60:.1f}min"
+        )
+
+        # --- Checkpoint ---
+        if batch_end % args.checkpoint_every < batch_size or batch_end >= total_samples:
+            logger.info(f"Saving checkpoint at sample {batch_end}...")
             torch.save(
                 {
                     "icr_scores": icr_scores_dict,
                     "labels": labels_dict,
-                    "next_idx": idx + 1,
+                    "next_idx": batch_end,
                 },
                 ckpt_path,
             )
